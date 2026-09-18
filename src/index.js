@@ -1,11 +1,12 @@
 'use strict';
 
 const { spawn } = require('node:child_process');
-const readline = require('node:readline');
 const { fetchArticle, fetchTopArticles, extractArticle, downloadArticle } = require('./fetch.js');
 const { htmlToMarkdown } = require('./converter.js');
 const { renderMarkdown } = require('./render.js');
 const { resolveMode } = require('./images.js');
+const { pick } = require('./picker.js');
+const { filterTopItems, topCategoryLabel, topItemLabel } = require('./top.js');
 
 const VERSION = require('../package.json').version;
 
@@ -76,13 +77,18 @@ async function emitArticle(text, opts) {
 const HELP = `freedium — Read Medium articles without the paywall, in your terminal
 
 usage:
-  freedium <url>           read a Medium article
-  freedium top             browse the latest unlocked articles and pick one
-  freedium top 3           open the 3rd article in the list
-  freedium <url> -m        dump raw markdown (great for piping)
-  freedium <url> -o file   write markdown to a file
-  freedium -h              show this help
-  freedium -v              show version
+  freedium <url>             read a Medium article
+  freedium top               browse the front page and pick one (↑/↓ + enter)
+  freedium top <category>    browse a category (see categories below)
+  freedium top <category> 3  open the 3rd article in that category
+  freedium <url> -m          dump raw markdown (great for piping)
+  freedium <url> -o file     write markdown to a file
+  freedium -h                show this help
+  freedium -v                show version
+
+categories:
+  latest (default), trending, week, long, all
+  ...or any keyword, e.g. "ai", "security", "python", "startup"
 
 options:
   -h, --help       show this help message
@@ -114,16 +120,6 @@ function fail(message) {
   process.exit(1);
 }
 
-function prompt(question) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer);
-    });
-  });
-}
-
 async function showArticle(url, opts) {
   const articleHtml = await fetchArticle(url, opts.host);
   const article = extractArticle(articleHtml);
@@ -149,46 +145,58 @@ async function showArticle(url, opts) {
 }
 
 async function runTop(opts) {
-  const items = await fetchTopArticles(opts.host);
+  const all = await fetchTopArticles(opts.host);
+  if (!all.length) {
+    fail(`no articles found on ${opts.host}`);
+    return;
+  }
+
+  const category = opts.topCategory || 'latest';
+  const items = filterTopItems(all, category);
   if (!items.length) {
-    fail(`no articles found in the feed from ${opts.host}`);
+    fail(`no articles found for "${category}" on ${opts.host}`);
     return;
   }
 
   if (opts.topIndex) {
     const picked = items[opts.topIndex - 1];
-    if (!picked) fail(`no article #${opts.topIndex} (the feed has ${items.length})`);
+    if (!picked) fail(`no article #${opts.topIndex} (${topCategoryLabel(category)} has ${items.length})`);
     return showArticle(picked.link, opts);
   }
 
-  const list = items
-    .map((item, i) => {
-      const num = String(i + 1).padStart(2);
-      const by = item.author ? `\n      ${item.author}${item.date ? ' · ' + item.date : ''}` : '';
-      return `  ${num}. ${item.title}${by}`;
-    })
-    .join('\n');
+  const nonInteractive = !process.stdin.isTTY || !process.stdout.isTTY || opts.markdown || opts.output;
 
-  process.stdout.write(`Top articles on ${opts.host}:\n\n${list}\n\n`);
-
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  if (nonInteractive) {
+    const list = items
+      .map((item, i) => {
+        const num = String(i + 1).padStart(2);
+        const meta = [
+          item.creator,
+          item.readingTime ? item.readingTime + ' min' : '',
+          item.publishedAt ? item.publishedAt.slice(0, 10) : '',
+        ]
+          .filter(Boolean)
+          .join(' · ');
+        return `  ${num}. ${item.title}${meta ? `\n      ${meta}` : ''}`;
+      })
+      .join('\n');
+    process.stdout.write(`Top articles — ${topCategoryLabel(category)} (${opts.host}):\n\n${list}\n`);
     return;
   }
 
-  process.stdout.write(`Select an article (1-${items.length}) or q to quit\n`);
-  const answer = (await prompt('> ')).trim();
-  if (!answer || /^(q|quit|exit)$/i.test(answer)) {
+  const selected = await pick(items, {
+    color: opts.color,
+    header: `Top articles on ${opts.host} · ${topCategoryLabel(category)}`,
+    hint: '↑/↓ move · enter open · q quit',
+    label: topItemLabel,
+  });
+
+  if (selected == null) {
     process.stdout.write('Aborted.\n');
     return;
   }
 
-  const n = Number(answer);
-  if (!Number.isInteger(n) || n < 1 || n > items.length) {
-    fail(`invalid selection: ${answer}`);
-    return;
-  }
-
-  return showArticle(items[n - 1].link, opts);
+  return showArticle(items[selected].link, opts);
 }
 
 async function run() {
@@ -201,6 +209,7 @@ async function run() {
     url: null,
     command: null,
     topIndex: null,
+    topCategory: null,
     image: process.env.FREEDIUM_IMAGE_MODE ? normalizeImageMode(process.env.FREEDIUM_IMAGE_MODE) || 'text' : 'text',
     imageWidth: process.env.FREEDIUM_IMAGE_WIDTH ? Number(process.env.FREEDIUM_IMAGE_WIDTH) : null,
     pager: true,
@@ -259,8 +268,14 @@ async function run() {
         break;
       default:
         if (arg.startsWith('-')) fail(`unknown option: ${arg}`);
-        if (opts.command === 'top' && /^\d+$/.test(arg)) {
-          opts.topIndex = Number(arg);
+        if (opts.command === 'top') {
+          if (/^\d+$/.test(arg)) {
+            opts.topIndex = Number(arg);
+          } else if (!opts.topCategory) {
+            opts.topCategory = arg;
+          } else {
+            fail(`unexpected argument for top: "${arg}"`);
+          }
           break;
         }
         if (opts.url) fail(`too many arguments: expected one URL, got "${arg}"`);

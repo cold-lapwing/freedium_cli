@@ -60,6 +60,86 @@ async function fetchArticle(url, host) {
   return res.text();
 }
 
+function unescapeJs(str) {
+  if (!str) return '';
+  return str.replace(/\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)/g, (_, esc) => {
+    if (esc[0] === 'u' || esc[0] === 'x') return String.fromCodePoint(parseInt(esc.slice(1), 16));
+    const map = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', v: '\v', '0': '\0' };
+    return map[esc] !== undefined ? map[esc] : esc;
+  });
+}
+
+// Pull `{slug:"...", title:"...", ...}` objects out of the SvelteKit hydration
+// payload. The objects are JS literals, not JSON, so walk them quote-aware to
+// find each balanced block instead of trusting field order.
+function extractDataBlocks(seg) {
+  const blocks = [];
+  for (let i = 0; i < seg.length; i++) {
+    if (seg[i] !== '{' || !/^\{\s*slug:"/.test(seg.slice(i, i + 10))) continue;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let j = i;
+    for (; j < seg.length; j++) {
+      const c = seg[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === '\\') esc = true;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') {
+        inStr = true;
+      } else if (c === '{') {
+        depth++;
+      } else if (c === '}') {
+        depth--;
+        if (depth === 0) {
+          j++;
+          break;
+        }
+      }
+    }
+    blocks.push(seg.slice(i, j));
+    i = j - 1;
+  }
+  return blocks;
+}
+
+const FEED_FIELDS = {
+  slug: /\bslug:"((?:[^"\\]|\\.)*)"/,
+  title: /\btitle:"((?:[^"\\]|\\.)*)"/,
+  excerpt: /\bexcerpt:"((?:[^"\\]|\\.)*)"/,
+  image: /\bimageUrl:"((?:[^"\\]|\\.)*)"/,
+  readingTime: /\breadingTime:"([^"]*)"/,
+  publishedAt: /\bpublishedAt:"([^"]*)"/,
+  creator: /\bcreator:"((?:[^"\\]|\\.)*)"/,
+  collection: /\bcollection:(null|\{[\s\S]*?\})/,
+};
+
+function parseFeedItem(block) {
+  const get = (k) => {
+    const m = block.match(FEED_FIELDS[k]);
+    return m ? m[1] : undefined;
+  };
+  const colRaw = get('collection');
+  const colName =
+    colRaw && colRaw !== 'null' ? (colRaw.match(/\bname:"((?:[^"\\]|\\.)*)"/) || [])[1] : undefined;
+
+  const id = unescapeJs(get('slug') || '');
+  const title = unescapeJs(get('title') || '');
+  if (!id || !title) return null;
+
+  return {
+    id,
+    title,
+    excerpt: unescapeJs(get('excerpt') || ''),
+    image: get('image') || '',
+    readingTime: Number(get('readingTime')) || 0,
+    publishedAt: get('publishedAt') || '',
+    creator: unescapeJs(get('creator') || ''),
+    collection: colName ? unescapeJs(colName) : null,
+  };
+}
+
 async function fetchTopArticles(host, options = {}) {
   if (/^https?:\/\//i.test(host)) {
     host = new URL(host).hostname;
@@ -67,10 +147,11 @@ async function fetchTopArticles(host, options = {}) {
 
   let res;
   try {
-    res = await fetch(`https://${host}/rss`, {
+    res = await fetch(`https://${host}/`, {
       headers: {
         'User-Agent': UA,
-        Accept: 'application/rss+xml, application/xml, text/xml',
+        Accept: 'text/html,application/xhtml+xml',
+        'Accept-Language': 'en-US,en;q=0.9',
       },
       redirect: 'follow',
     });
@@ -85,33 +166,20 @@ async function fetchTopArticles(host, options = {}) {
     throw new Error(`could not fetch the feed from ${host} (HTTP ${res.status})`);
   }
 
-  const xml = await res.text();
-  const items = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
-  const out = [];
+  const html = await res.text();
+  const idx = html.indexOf('resolve(');
+  const seg = idx === -1 ? html : html.slice(idx);
+  const items = extractDataBlocks(seg)
+    .map(parseFeedItem)
+    .filter(Boolean)
+    .map((item) => ({
+      ...item,
+      // The front page only exposes the article hash; freedium resolves the
+      // full article (and redirects) from it.
+      link: `https://medium.com/${item.id}`,
+    }));
 
-  for (const m of items) {
-    const block = m[1];
-    const pick = (re) => {
-      const match = block.match(re);
-      return match ? decodeEntities(stripTags(match[1])) : '';
-    };
-
-    const title = pick(/<title>([\s\S]*?)<\/title>/i);
-    let link = pick(/<link>([\s\S]*?)<\/link>/i);
-    const author = pick(/<dc:creator>([\s\S]*?)<\/dc:creator>/i);
-    const date = pick(/<pubDate>([\s\S]*?)<\/pubDate>/i);
-    if (!title || !link) continue;
-
-    // The feed wraps each article as https://<mirror>/https://medium.com/...
-    // Unwrap it back to the original URL so fetchArticle can re-wrap for the
-    // user's chosen host.
-    const unwrapped = link.replace(/^https?:\/\/[^/]+\//i, '');
-    if (/^https?:\/\//i.test(unwrapped)) link = unwrapped;
-
-    out.push({ title, link, author, date });
-  }
-
-  return options.limit ? out.slice(0, options.limit) : out;
+  return options.limit ? items.slice(0, options.limit) : items;
 }
 
 function decodeEntities(str) {

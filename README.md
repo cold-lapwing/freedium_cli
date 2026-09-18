@@ -26,7 +26,7 @@ network.
 
 ```
 freedium [options] <url>
-freedium top [n]
+freedium top [category] [n]
 ```
 
 Read a Medium article:
@@ -35,23 +35,43 @@ Read a Medium article:
 freedium https://medium.com/@elmo-anderson/the-great-manure-mystery-1b184e2a44c8
 ```
 
-Browse the latest unlocked articles and pick one interactively:
+Browse the front page in an interactive menu — move with `↑`/`↓` and press
+`Enter` to open the highlighted article:
 
 ```sh
 freedium top
 ```
 
 ```
-Top articles on freedium-mirror.cfd:
-
-   1. The Great Manure Mystery
-      Elmo Anderson · Fri, 18 Sep 2026 06:20:00 GMT
-   2. ...
-Select an article (1-30) or q to quit
-> 1
+Top articles on freedium-mirror.cfd · latest      ↑/↓ move · enter open · q quit
+>  1. The Great Manure Mystery  ·  Elmo Anderson  ·  5 min
+   2. Why Does Telegram Care So Much About Privacy?  ·  David Baek  ·  34 min
+   3. ...
 ```
 
-Jump straight to an entry with `freedium top 3`.
+### Categories
+
+`freedium top <category>` filters the list:
+
+| category   | what it shows                                    |
+| ---------- | ------------------------------------------------ |
+| `latest`   | newest first (default)                           |
+| `trending` | the mirror's curated front-page order            |
+| `week`     | published in the last 7 days                     |
+| `long`     | long reads (7+ min), longest first               |
+| `all`      | the whole front page, unfiltered                 |
+
+Any other word is treated as a keyword filter over title, excerpt, author and
+publication — e.g. `freedium top ai`, `freedium top security utm`:
+
+```sh
+freedium top long        # interactive long-reads menu
+freedium top security    # interactive menu of security posts
+freedium top long 3      # open the 3rd long read directly
+```
+
+When output is piped, `top` prints the list instead of prompting, so it stays
+scriptable.
 
 Real output looks roughly like:
 
