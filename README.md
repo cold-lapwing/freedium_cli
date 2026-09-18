@@ -10,7 +10,6 @@ branding. No account, no bullshit, no paywall.
 > For hackers the terminal is the default UI, and Medium is the default Google
 > News. This combines the two.
 
-![freedium]
 
 ## Install
 
@@ -277,4 +276,4 @@ freedium --host freedium2.example.cfd <url>
 
 MIT
 
-![freedium]: https://avatars.githubusercontent.com/u/142643505?s=100&v=4
+[freedium]: https://avatars.githubusercontent.com/u/142643505?s=100&v=4
