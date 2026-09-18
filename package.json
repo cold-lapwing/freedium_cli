@@ -1,0 +1,31 @@
+{
+  "name": "freediumcli",
+  "version": "1.0.0",
+  "description": "Freedium — read Medium articles without the paywall, right in your terminal",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "bin": {
+    "freedium": "./bin/freedium.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "keywords": [
+    "medium",
+    "freedium",
+    "cli",
+    "reader",
+    "paywall",
+    "terminal",
+    "links",
+    "article"
+  ],
+  "license": "MIT"
+}
