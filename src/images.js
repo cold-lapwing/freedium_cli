@@ -1,14 +1,15 @@
 'use strict';
 
-// Terminal image rendering, focused on Linux terminals. Zero runtime
-// dependencies.
+// Terminal image rendering across Linux, macOS and Windows terminals.
+// Zero runtime dependencies.
 //
-// Strategies (best first):
-//   1. kitty  — kitty graphics protocol (kitty, WezTerm; raw bytes, no decode)
-//   2. ansi   — universal half-block rendering used by GNOME Terminal, Konsole
-//               and friends, via a system decoder (magick → convert → chafa →
-//               viu → img2txt → jp2a)
-//   3. text   — the classic [image: alt] placeholder (used when piped)
+// Strategies (best first, platform-aware):
+//   1. iterm2 — iTerm2 inline images (OSC 1337) on macOS, no decode
+//   2. kitty  — kitty graphics protocol (kitty, WezTerm; raw bytes, no decode)
+//   3. ansi   — universal half-block rendering (GNOME Terminal, Konsole, Windows
+//               with an installed decoder) via a system decoder (magick → convert →
+//               chafa → viu → img2txt → jp2a)
+//   4. text   — the classic [image: alt] placeholder (used when piped / unsupported)
 
 const { spawnSync } = require('node:child_process');
 
@@ -92,6 +93,17 @@ function findDecoder() {
 
 // ---- mode detection ----
 
+function isIterm2() {
+  // iTerm2 on macOS uses TERM_PROGRAM=iTerm.app (or historically
+  // "iTerm.app"). The protocol also de-facto works in WezTerm when the
+  // OSC 1337 handler is enabled, but we only pick iterm2 mode when we
+  // detect a native iTerm2 session so users don't get garbled output
+  // elsewhere.
+  const tp = (process.env.TERM_PROGRAM || '').toLowerCase();
+  if (tp === 'iterm.app' || tp === 'iterm2.app' || tp === 'iterm') return true;
+  return false;
+}
+
 function supportsSixel() {
   // VTE 0.78+ powers GNOME Terminal / GNOME Console 47+ and Konsole's sixel
   // support; explicit sixel TERMs (foot, mlterm, ghostty, …) also qualify.
@@ -105,19 +117,45 @@ function isKitty() {
   return !!(process.env.KITTY_WINDOW_ID || t.includes('kitty') || process.env.TERM_PROGRAM === 'WezTerm');
 }
 
+// transforms an override into a usable mode given the current terminal and the
+// user's OS preference (see src/os.js).
 function detectMode(override, opts) {
   if (override && override !== 'auto') return override;
   if (!opts.useColor || !opts.isTTY) return 'text';
+
+  // Explicit override already handled above. For 'auto', prefer the
+  // protocol that matches the user's actual terminal/OS.
+  if (opts.os === 'macos' || opts.os === 'darwin') {
+    if (isIterm2()) return 'iterm2';
+    // macOS can also run kitty/WezTerm; fall through to generic detection.
+  }
+  if (opts.os === 'windows') {
+    // Windows terminals have no native image protocol in this codebase.
+    // Only render when a system decoder is available (ansicon, wsl, etc.).
+    if (!findDecoder()) return 'text';
+    // keep 'ansi' below only if decoder present
+  }
   if (isKitty()) return 'kitty';
+  if (supportsSixel()) return 'sixel';
   return 'ansi';
 }
 
 // transforms an override into a usable mode given the current terminal
 function resolveMode(override, opts) {
-  const mode = detectMode(override, opts);
+  const mode = detectMode(override, {
+    useColor: opts.useColor,
+    isTTY: opts.isTTY,
+    os: opts.os,
+  });
   const noDecoder = () => ({ mode: 'text', decoder: '', note: 'no image decoder found (install imagemagick, chafa, viu, img2txt or jp2a)' });
 
   if (mode === 'text') return { mode: 'text', decoder: '', note: false };
+
+  if (mode === 'iterm2') {
+    // iTerm2 has built-in image support; no system decoder needed.
+    if (isIterm2()) return { mode, decoder: '', note: false };
+    return noDecoder();
+  }
 
   const decoder = findDecoder();
 
@@ -212,6 +250,29 @@ function ansiHalfBlock(buf, decoder, grid) {
   return text.split('\n').map((l) => l.replace(/\s+$/, ''));
 }
 
+// ---- iTerm2 inline images (OSC 1337) — macOS ----
+
+// iTerm2-specific image rendering via OSC 1337 (https://iterm2.com/documentation-images.html).
+// The image is sent as base64 in a single File transfer sequence; the terminal
+// decodes it natively (supports PNG, JPEG, GIF, WebP on macOS).
+function iterm2Image(buf, format, grid) {
+  const b64 = buf.toString('base64');
+  // width/height can be given as character cells ("N"), pixels ("Npx") or
+  // "auto". We render at the grid width in character cells so the image fills
+  // the console width — iTerm2 will upscale/downscale accordingly.
+  const size = readImageSize(buf);
+  const width = size ? Math.max(160, grid.cols * 2) + 'px' : 'auto';
+  const height = size ? Math.round((size.h * grid.cols * 2) / size.w) + 'px' : 'auto';
+  const args = [
+    'inline=1',
+    'preserveAspectRatio=1',
+    'width=' + width,
+    'height=' + height,
+  ].join(';');
+  // OSC 1337 ; File = args : base64  BEL
+  return '\x1b]1337;File=' + args + ':' + b64 + '\x07';
+}
+
 // ---- kitty graphics protocol ----
 
 function kittyImage(buf, format, grid) {
@@ -287,4 +348,4 @@ function renderSixelFromRgb(buf, decoder, grid) {
   return ['', rgbToSixel(rgb, tw, th, 256), ''];
 }
 
-module.exports = { resolveImageUrl, fetchImage, readImageSize, findDecoder, findSixelDecoder, detectMode, resolveMode, imageGrid, renderSixel, ansiHalfBlock, kittyImage };
+module.exports = { resolveImageUrl, fetchImage, readImageSize, findDecoder, findSixelDecoder, detectMode, resolveMode, imageGrid, renderSixel, ansiHalfBlock, kittyImage, iterm2Image, isIterm2 };

@@ -13,6 +13,7 @@ const {
   renderSixel,
   ansiHalfBlock,
   kittyImage,
+  iterm2Image,
 } = require('./images.js');
 
 const ESC = '\x1b[';
@@ -60,6 +61,7 @@ class Renderer {
     this.host = opts.host || null;
     this.imageWidth = opts.imageWidth != null ? opts.imageWidth : null;
     this.imageIndicator = opts.image || 'auto';
+    this.os = opts.os || null;
     this.rows = opts.rows || process.stdout.rows || 40;
     this._imageCfg = null;
     this._imageNoteShown = false;
@@ -67,7 +69,11 @@ class Renderer {
 
   imageConfig() {
     if (this._imageCfg) return this._imageCfg;
-    const cfg = resolveMode(this.imageIndicator, { useColor: this.color, isTTY: this.isTTY });
+    const cfg = resolveMode(this.imageIndicator, {
+      useColor: this.color,
+      isTTY: this.isTTY,
+      os: this.os,
+    });
     if (cfg.note && !this._imageNoteShown) {
       this._imageNoteShown = true;
       process.stderr.write('⚠ ' + cfg.note + '\n');
@@ -117,6 +123,10 @@ class Renderer {
 
       if (cfg.mode === 'kitty') {
         return ['', kittyImage(buffer, format, grid), ''];
+      }
+
+      if (cfg.mode === 'iterm2') {
+        return ['', iterm2Image(buffer, format, grid), ''];
       }
 
       if (cfg.mode === 'sixel') {

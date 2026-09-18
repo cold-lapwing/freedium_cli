@@ -35,47 +35,101 @@ Read a Medium article:
 freedium https://medium.com/@elmo-anderson/the-great-manure-mystery-1b184e2a44c8
 ```
 
-Browse the front page in an interactive menu — move with `↑`/`↓` and press
-`Enter` to open the highlighted article:
+Browse what's new on **medium.com** in an interactive menu — move with `↑`/`↓`
+and press `Enter` to open the highlighted article:
 
 ```sh
 freedium top
 ```
 
 ```
-Top articles on freedium-mirror.cfd · latest      ↑/↓ move · enter open · q quit
->  1. The Great Manure Mystery  ·  Elmo Anderson  ·  5 min
-   2. Why Does Telegram Care So Much About Privacy?  ·  David Baek  ·  34 min
+Top articles on medium.com · latest        ↑/↓ move · enter open · q quit
+>  1. The Empathy Gap: Why AI Can Simulate Understanding…  ·  Pascal Gemperli  ·  4 min
+   2. Machine Learning: A Recommended Reading List  ·  Shreyas Naphad  ·  6 min
    3. ...
 ```
 
 ### Categories
 
-`freedium top <category>` filters the list:
+`freedium top <category>` chooses which Medium feed to pull:
 
-| category   | what it shows                                    |
-| ---------- | ------------------------------------------------ |
-| `latest`   | newest first (default)                           |
-| `trending` | the mirror's curated front-page order            |
-| `week`     | published in the last 7 days                     |
-| `long`     | long reads (7+ min), longest first               |
-| `all`      | the whole front page, unfiltered                 |
+| category   | what it shows                                          |
+| ---------- | ------------------------------------------------------ |
+| `latest`   | newest articles across the default topics (default)    |
+| `trending` | this week's most-clapped stories                        |
+| `week`     | published in the last 7 days, by claps                  |
+| `long`     | 7+ minute reads, longest first                          |
+| `all`      | all-time most-clapped stories                           |
 
-Any other word is treated as a keyword filter over title, excerpt, author and
-publication — e.g. `freedium top ai`, `freedium top security utm`:
+Any other word is treated as a **Medium topic** — `freedium top ai`,
+`freedium top security`, `freedium top machine learning` — and pulls that tag's
+feed. Multi-word topics are turned into tag slugs (`machine learning` →
+`machine-learning`):
 
 ```sh
-freedium top long        # interactive long-reads menu
-freedium top security    # interactive menu of security posts
-freedium top long 3      # open the 3rd long read directly
+freedium top long                  # interactive long-reads menu
+freedium top security              # interactive menu of the security topic
+freedium top machine learning 3    # open the 3rd "machine-learning" article
 ```
 
-When output is piped, `top` prints the list instead of prompting, so it stays
-scriptable.
+Bare `freedium top` merges several popular topics (technology, programming,
+AI, data science, software development, startup) and de-duplicates them, so you
+get a broad list rather than one narrow feed.
 
-Real output looks roughly like:
+Data comes from Medium's own topic feed (the same one its topic pages use),
+with the per-tag RSS feed as a fallback. When output is piped, `top` prints the
+list instead of prompting, so it stays scriptable.
 
+### Search
+
+Search Medium's public index and browse matching articles interactively:
+
+```sh
+freedium search rust                # search articles about "rust"
+freedium search "machine learning"  # multi-word queries
+freedium search rust 3              # open the 3rd result directly
+freedium search rust --limit 10     # cap at 10 results (default 25)
 ```
+
+Each result shows the title, author, reading time, date and clap count. When you
+pipe the output, the list prints one per line instead of prompting — handy for
+scripts. A trailing number opens that result immediately (1-based):
+
+```sh
+freedium search kubernetes 7 | head
+freedium -m "search quantum computing 1" > article.md
+```
+
+Results come from Medium's own search GraphQL endpoint, so they stay current.
+
+### Configuration
+
+Settings are persisted at `~/.freedium/config.json` and picked up on every run.
+Preferences follow a **low→high** precedence: config file values are the default,
+**environment variables** override those, and **CLI flags** override everything:
+
+| setting         | config key      | env var              | flag               |
+| --------------- | --------------- | -------------------- | ------------------ |
+| OS              | `os`            | `FREEDIUM_OS`        | _auto-detected_    |
+| Image mode      | `image`         | `FREEDIUM_IMAGE_MODE`| `--image`          |
+| Image width     | `imageWidth`    | `FREEDIUM_IMAGE_WIDTH`| `--image-width`   |
+| Mirror host     | `host`          | `FREEDIUM_HOST`      | `--host`           |
+| Extra mirrors   | _array_         | `FREEDIUM_HOSTS`     | _—_                |
+| Search limit    | `limit`         | `FREEDIUM_LIMIT`     | `--limit`          |
+| Pager           | _—_             | `FREEDIUM_PAGER`     | `--no-pager`       |
+| Disable images  | _—_             | `FREEDIUM_NO_IMAGES` | `--no-images`      |
+
+`FREEDIUM_OS` accepts `linux`, `macos`, `windows`, or `freebsd` and overrides
+autodetection — useful to force `iterm2` mode for iTerm2 when running under
+`tmux`/`screen`, or to point a non-standard terminal at the right renderer.
+
+```sh
+# set once via the CLI (written to config)
+freedium --image kitty --image-width 80
+# or manually edit ~/.freedium/config.json
+```
+
+
 A Totally Normal Medium Article
 ───────────────────────────────
 Author   ·  5 min read  ·  Jan 1, 2026
@@ -97,18 +151,52 @@ and lists all survive the trip.
 | `--no-pager`             | print straight through instead of paging          |
 | `--no-images`            | show images as text placeholders                  |
 | `--image-width <n>`      | image width in terminal columns (default: full width) |
-| `--image <value>`        | images are **off by default**; enable with `true`, `auto`, `ansi`, `sixel`, or `kitty` |
+| `--image <value>`        | images are **off by default**; enable with `true`, `auto`, `ansi`, `sixel`, `kitty`, `iterm2`, or `windows` |
+| `--image-width <n>`      | image width in terminal columns (default: full width) |
+| `--limit <n>`            | max search results (default: 25)                |
 | `--host <host>`          | use a different freedium mirror                   |
 | `FREEDIUM_HOST` env var  | same, via the environment                         |
+| `FREEDIUM_HOSTS` env var | comma-separated extra mirrors to fail over to     |
 | `FREEDIUM_PAGER` env var | pager command (default: `$PAGER`, else `less`)    |
 
 Long articles open in a pager so you always start reading at the top. Disable it
 with `--no-pager`, or set `FREEDIUM_PAGER` (e.g. `FREEDIUM_PAGER=cat`).
 
+### When the mirror is down
+
+The community mirror `freedium-mirror.cfd` goes up and down periodically. The
+CLI retries transient `5xx`/network failures and can hop to other mirrors:
+
+```sh
+FREEDIUM_HOSTS="freedium.cfd,my-mirror.example" freedium <url>
+```
+
+`freedium top` listings come straight from medium.com, so they keep working even
+when the mirror is down — only opening an article needs the mirror.
+
 ## Images
 
-Images are **opt-in** — by default they show as a `[ image ]` placeholder. Pass
-`--image true` to render them, tuned for **Linux terminals**:
+Images are **opt-in** — by default they show as a `[ image ]` placeholder. The
+correct backend is chosen automatically from your OS and terminal, then you can
+force a specific one with `--image`:
+
+```sh
+freedium --image true <url>      # auto: best mode for your OS (macOS -> iterm2, Linux -> kitty/sixel/ansi)
+freedium --image ansi <url>      # force ANSI half-blocks
+freedium --image sixel <url>     # force sixel (GNOME Terminal, foot, mlterm…)
+freedium --image kitty <url>     # force kitty graphics (kitty, WezTen)
+freedium --image iterm2 <url>   # force iTerm2 OSC 1337 (macOS)
+freedium --image windows <url>  # force Windows terminal decoder rendering
+```
+
+| mode      | where it works                                  | notes                                    |
+| --------- | ----------------------------------------------- | ---------------------------------------- |
+| `iterm2`  | iTerm2 on macOS (OSC 1337)                       | no system decoder needed, base64 in-band |
+| `kitty`   | kitty, WezTen (auto-detected on Linux/macOS)     | native protocol, full resolution        |
+| `ansi`    | anywhere with a decoder (Linux default)         | half-block with 24-bit color            |
+| `sixel`   | GNOME Terminal / Console 47+, Konsole, foot, mlterm | near-native resolution, real pixels      |
+| `windows` | Windows Terminal (requires ImageMagick)          | uses system decoder, then half-blocks    |
+| `text`    | images disabled                                 | `[ image ]` placeholder                  |
 
 ```sh
 freedium --image true <url>      # enable images (ANSI half-blocks by default)

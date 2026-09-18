@@ -21,165 +21,270 @@ function normalizeUrl(url) {
   return parsed.toString();
 }
 
-async function fetchArticle(url, host) {
-  const target = normalizeUrl(url);
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
-  if (/^https?:\/\//i.test(host)) {
-    host = new URL(host).hostname;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function httpMessage(status, host) {
+  if (status === 404) {
+    return 'unable to read that URL — the article could not be resolved (404)';
   }
-
-  const freediumUrl = `https://${host}/${target.replace(/^https?:\/\//i, '')}`;
-
-  let res;
-  try {
-    res = await fetch(freediumUrl, {
-      headers: {
-        'User-Agent': UA,
-        Accept: 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      redirect: 'follow',
-    });
-  } catch (err) {
-    throw new Error(
-      `could not reach ${host} (${err.cause?.code || err.message}). ` +
-        `Try a different mirror with --host or the FREEDIUM_HOST env var.`
+  if (status === 429 || status === 403) {
+    return `rate-limited by ${host} (${status}). Try again later.`;
+  }
+  if (status === 503 || status === 502 || status === 504) {
+    return (
+      `${host} is temporarily unavailable (${status}). The freedium mirror ` +
+      `looks down — try again shortly, or use --host / FREEDIUM_HOSTS with another mirror.`
     );
   }
+  return `freedium returned HTTP ${status}`;
+}
 
-  if (!res.ok) {
-    if (res.status === 404) {
-      throw new Error(`unable to read that URL — the article could not be resolved (404)`);
+// Build the freedium URL, retrying transient failures (5xx / network) before
+// giving up on this host.
+async function fetchFromHost(target, host, attempts) {
+  const hostname = /^https?:\/\//i.test(host) ? new URL(host).hostname : host;
+  const freediumUrl = `https://${hostname}/${target.replace(/^https?:\/\//i, '')}`;
+
+  let lastStatus = 0;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let res;
+    try {
+      res = await fetch(freediumUrl, {
+        headers: {
+          'User-Agent': UA,
+          Accept: 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+        redirect: 'follow',
+      });
+    } catch (err) {
+      if (attempt < attempts) {
+        await sleep(300 * attempt);
+        continue;
+      }
+      const e = new Error(
+        `could not reach ${hostname} (${err.cause?.code || err.message}). ` +
+          `Try a different mirror with --host or the FREEDIUM_HOSTS env var.`
+      );
+      e.retryable = true;
+      throw e;
     }
-    if (res.status === 429 || res.status === 403) {
-      throw new Error(`rate-limited by ${host} (${res.status}). Try again later.`);
+
+    if (res.ok) return res.text();
+
+    lastStatus = res.status;
+    if (RETRYABLE_STATUS.has(res.status) && attempt < attempts) {
+      await sleep(400 * attempt);
+      continue;
     }
-    throw new Error(`freedium returned HTTP ${res.status}`);
+
+    const e = new Error(httpMessage(res.status, hostname));
+    e.status = res.status;
+    e.retryable = RETRYABLE_STATUS.has(res.status);
+    throw e;
   }
 
-  return res.text();
+  const e = new Error(httpMessage(lastStatus, hostname));
+  e.status = lastStatus;
+  e.retryable = true;
+  throw e;
 }
 
-function unescapeJs(str) {
-  if (!str) return '';
-  return str.replace(/\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)/g, (_, esc) => {
-    if (esc[0] === 'u' || esc[0] === 'x') return String.fromCodePoint(parseInt(esc.slice(1), 16));
-    const map = { n: '\n', t: '\t', r: '\r', b: '\b', f: '\f', v: '\v', '0': '\0' };
-    return map[esc] !== undefined ? map[esc] : esc;
-  });
+async function fetchArticle(url, host, options = {}) {
+  const target = normalizeUrl(url);
+  const hosts = (Array.isArray(host) ? host : [host]).filter(Boolean);
+  const attempts = Math.max(1, options.attempts || 2);
+
+  let lastErr;
+  for (let i = 0; i < hosts.length; i++) {
+    try {
+      return await fetchFromHost(target, hosts[i], attempts);
+    } catch (err) {
+      lastErr = err;
+      // Only hop to the next mirror for transient problems; a 404 is final.
+      if (err.retryable && i < hosts.length - 1) continue;
+      throw err;
+    }
+  }
+
+  throw lastErr || new Error('no freedium host available');
 }
 
-// Pull `{slug:"...", title:"...", ...}` objects out of the SvelteKit hydration
-// payload. The objects are JS literals, not JSON, so walk them quote-aware to
-// find each balanced block instead of trusting field order.
-function extractDataBlocks(seg) {
-  const blocks = [];
-  for (let i = 0; i < seg.length; i++) {
-    if (seg[i] !== '{' || !/^\{\s*slug:"/.test(seg.slice(i, i + 10))) continue;
-    let depth = 0;
-    let inStr = false;
-    let esc = false;
-    let j = i;
-    for (; j < seg.length; j++) {
-      const c = seg[j];
-      if (inStr) {
-        if (esc) esc = false;
-        else if (c === '\\') esc = true;
-        else if (c === '"') inStr = false;
-      } else if (c === '"') {
-        inStr = true;
-      } else if (c === '{') {
-        depth++;
-      } else if (c === '}') {
-        depth--;
-        if (depth === 0) {
-          j++;
-          break;
-        }
+const MEDIUM_GRAPHQL = 'https://medium.com/_/graphql';
+
+// Medium's own topic feed (`Query.tagFeed`), the same data the topic page
+// renders in `__APOLLO_STATE__` — but as one call that also returns reading
+// time, clap counts and tags. `paging.limit` is capped at 25 by the API.
+const TOPIC_FEED_QUERY = `query TopicFeed($tagSlug: String!) {
+  tagFeed(tagSlug: $tagSlug, mode: %MODE%, paging: {limit: %LIMIT%}) {
+    items {
+      post {
+        id
+        title
+        uniqueSlug
+        mediumUrl
+        readingTime
+        firstPublishedAt
+        latestPublishedAt
+        clapCount
+        isLocked
+        creator { name username }
+        collection { name }
+        previewImage { id alt }
+        tags { displayTitle }
       }
     }
-    blocks.push(seg.slice(i, j));
-    i = j - 1;
   }
-  return blocks;
-}
+}`;
 
-const FEED_FIELDS = {
-  slug: /\bslug:"((?:[^"\\]|\\.)*)"/,
-  title: /\btitle:"((?:[^"\\]|\\.)*)"/,
-  excerpt: /\bexcerpt:"((?:[^"\\]|\\.)*)"/,
-  image: /\bimageUrl:"((?:[^"\\]|\\.)*)"/,
-  readingTime: /\breadingTime:"([^"]*)"/,
-  publishedAt: /\bpublishedAt:"([^"]*)"/,
-  creator: /\bcreator:"((?:[^"\\]|\\.)*)"/,
-  collection: /\bcollection:(null|\{[\s\S]*?\})/,
-};
+const TOPIC_MODES = new Set(['TOP_WEEK', 'TOP_MONTH', 'TOP_YEAR', 'TOP_ALL_TIME', 'NEW']);
 
-function parseFeedItem(block) {
-  const get = (k) => {
-    const m = block.match(FEED_FIELDS[k]);
-    return m ? m[1] : undefined;
-  };
-  const colRaw = get('collection');
-  const colName =
-    colRaw && colRaw !== 'null' ? (colRaw.match(/\bname:"((?:[^"\\]|\\.)*)"/) || [])[1] : undefined;
-
-  const id = unescapeJs(get('slug') || '');
-  const title = unescapeJs(get('title') || '');
-  if (!id || !title) return null;
-
-  return {
-    id,
-    title,
-    excerpt: unescapeJs(get('excerpt') || ''),
-    image: get('image') || '',
-    readingTime: Number(get('readingTime')) || 0,
-    publishedAt: get('publishedAt') || '',
-    creator: unescapeJs(get('creator') || ''),
-    collection: colName ? unescapeJs(colName) : null,
-  };
-}
-
-async function fetchTopArticles(host, options = {}) {
-  if (/^https?:\/\//i.test(host)) {
-    host = new URL(host).hostname;
-  }
-
+async function mediumGraphQL(operationName, query, variables) {
   let res;
   try {
-    res = await fetch(`https://${host}/`, {
+    res = await fetch(MEDIUM_GRAPHQL, {
+      method: 'POST',
       headers: {
+        'content-type': 'application/json',
         'User-Agent': UA,
-        Accept: 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'apollo-require-preflight': 'true',
+        'x-apollo-operation-name': operationName,
       },
+      body: JSON.stringify({ operationName, query, variables }),
+    });
+  } catch (err) {
+    throw new Error(`could not reach medium.com (${err.cause?.code || err.message})`);
+  }
+
+  if (!res.ok) throw new Error(`medium.com returned HTTP ${res.status}`);
+
+  const json = await res.json();
+  if (json.errors && json.errors.length) {
+    throw new Error(json.errors.map((e) => e.message).join('; '));
+  }
+  return json.data;
+}
+
+// Normalize a Medium GraphQL `Post` into the shape the picker/filters use.
+function normalizePost(post) {
+  if (!post || !post.title) return null;
+  const link = post.mediumUrl || (post.uniqueSlug ? `https://medium.com/${post.uniqueSlug}` : '');
+  if (!link) return null;
+
+  const ts = post.firstPublishedAt || post.latestPublishedAt || 0;
+  return {
+    id: post.id || post.uniqueSlug || link,
+    title: post.title,
+    link,
+    creator: (post.creator && (post.creator.name || post.creator.username)) || '',
+    collection: (post.collection && post.collection.name) || '',
+    readingTime: post.readingTime ? Math.max(1, Math.round(post.readingTime)) : 0,
+    publishedAt: ts ? new Date(ts).toISOString() : '',
+    claps: post.clapCount || 0,
+    locked: Boolean(post.isLocked),
+    topics: (post.tags || []).map((t) => t.displayTitle).filter(Boolean),
+  };
+}
+
+async function fetchTopicFeed(topic, options = {}) {
+  const mode = TOPIC_MODES.has(options.mode) ? options.mode : 'TOP_WEEK';
+  const limit = Math.min(Math.max(1, Number(options.limit) || 25), 25);
+  const query = TOPIC_FEED_QUERY.replace('%MODE%', mode).replace('%LIMIT%', String(limit));
+  const data = await mediumGraphQL('TopicFeed', query, { tagSlug: topic });
+  const items = (data && data.tagFeed && data.tagFeed.items) || [];
+  return items.map((it) => normalizePost(it.post)).filter(Boolean);
+}
+
+function cdata(tag, xml) {
+  const m = xml.match(
+    new RegExp(`<${tag}>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?</${tag}>`)
+  );
+  return m ? m[1] : '';
+}
+
+// Fallback when GraphQL is unavailable: Medium's per-tag RSS (10 items).
+function parseRssItems(xml) {
+  return String(xml)
+    .split(/<item>/)
+    .slice(1)
+    .map((chunk) => {
+      const item = chunk.split('</item>')[0];
+      const title = decodeEntities(cdata('title', item).trim());
+      const link = decodeEntities(cdata('link', item).trim()).split('?')[0];
+      if (!title || !link) return null;
+      const pub = cdata('pubDate', item).trim();
+      return {
+        id: link,
+        title,
+        link,
+        creator: decodeEntities(cdata('dc:creator', item).trim()),
+        collection: '',
+        readingTime: 0,
+        publishedAt: pub && !Number.isNaN(Date.parse(pub)) ? new Date(pub).toISOString() : '',
+        claps: 0,
+        locked: false,
+        topics: [],
+      };
+    })
+    .filter(Boolean);
+}
+
+async function fetchTopicRss(topic) {
+  let res;
+  try {
+    res = await fetch(`https://medium.com/feed/tag/${encodeURIComponent(topic)}`, {
+      headers: { 'User-Agent': UA, Accept: 'application/rss+xml, application/xml, text/xml' },
       redirect: 'follow',
     });
   } catch (err) {
-    throw new Error(
-      `could not reach ${host} (${err.cause?.code || err.message}). ` +
-        `Try a different mirror with --host or the FREEDIUM_HOST env var.`
-    );
+    throw new Error(`could not reach medium.com (${err.cause?.code || err.message})`);
+  }
+  if (!res.ok) throw new Error(`medium.com returned HTTP ${res.status}`);
+  return parseRssItems(await res.text());
+}
+
+async function fetchMediumTopic(topic, options = {}) {
+  try {
+    const items = await fetchTopicFeed(topic, options);
+    if (items.length) return items;
+  } catch (err) {
+    // Fall through to RSS.
+  }
+  return fetchTopicRss(topic);
+}
+
+// Fetch several topics in parallel and merge them, de-duplicated by URL.
+async function fetchTopicFeeds(topics, mode) {
+  const results = await Promise.all(
+    topics.map(async (topic) => {
+      try {
+        return { items: await fetchMediumTopic(topic, { mode, limit: 25 }) };
+      } catch (err) {
+        return { error: err };
+      }
+    })
+  );
+
+  const seen = new Set();
+  const merged = [];
+  for (const result of results) {
+    for (const item of result.items || []) {
+      if (seen.has(item.link)) continue;
+      seen.add(item.link);
+      merged.push(item);
+    }
   }
 
-  if (!res.ok) {
-    throw new Error(`could not fetch the feed from ${host} (HTTP ${res.status})`);
+  // If nothing came back and every topic errored, surface the real cause
+  // (network/rate-limit) instead of a misleading "no articles found".
+  if (!merged.length && results.every((r) => r.error)) {
+    throw results[0].error;
   }
-
-  const html = await res.text();
-  const idx = html.indexOf('resolve(');
-  const seg = idx === -1 ? html : html.slice(idx);
-  const items = extractDataBlocks(seg)
-    .map(parseFeedItem)
-    .filter(Boolean)
-    .map((item) => ({
-      ...item,
-      // The front page only exposes the article hash; freedium resolves the
-      // full article (and redirects) from it.
-      link: `https://medium.com/${item.id}`,
-    }));
-
-  return options.limit ? items.slice(0, options.limit) : items;
+  return merged;
 }
 
 function decodeEntities(str) {
@@ -326,4 +431,147 @@ function slugify(str) {
     .replace(/^-|-$/g, '') || 'article';
 }
 
-module.exports = { fetchArticle, fetchTopArticles, extractArticle, downloadArticle, normalizeUrl };
+async function searchMediumQuery(query, options = {}) {
+  // Medium's SSR-rendered search is fetched through the GraphQL endpoint
+  // (medium.com/_/graphql) using the SearchQuery operation. This is the same
+  // query the web app uses to populate /search results. We request Posts only
+  // (withUsers/withTags/etc are all false) to keep the payload small.
+  const op = `
+    query SearchQuery($query: String!, $pagingOptions: SearchPagingOptions!, $withPosts: Boolean!, $postsSearchOptions: SearchOptions) {
+      search(query: $query) {
+        __typename
+        ... on Search {
+          posts(pagingOptions: $pagingOptions, algoliaOptions: $postsSearchOptions) @include(if: $withPosts) {
+            ... on SearchPost {
+              items {
+                id
+                title
+                uniqueSlug
+                mediumUrl
+                readingTime
+                firstPublishedAt
+                clapCount
+                isLocked
+                creator { name username }
+                collection { name }
+              }
+              pagingInfo {
+                next { limit page }
+              }
+            }
+          }
+        }
+      }
+    }
+  `.trim();
+
+  const variables = {
+    query: String(query || '').trim(),
+    pagingOptions: { limit: options.limit || 25, page: 0 },
+    withPosts: true,
+    postsSearchOptions: null,
+  };
+
+  const hostname = 'medium.com';
+  const body = JSON.stringify({ operationName: 'SearchQuery', query: op, variables });
+
+  const res = await fetch(`https://${hostname}/_/graphql`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'User-Agent': UA,
+      'Accept': 'application/json',
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`medium.com search returned HTTP ${res.status}: ${txt.slice(0, 200)}`);
+  }
+
+  let data;
+  try {
+    data = await res.json();
+  } catch (err) {
+    throw new Error(`medium.com returned invalid JSON (${err.message})`);
+  }
+
+  if (data.errors && data.errors.length) {
+    // GraphQLError messages are usually informative enough to surface.
+    const msg = data.errors.map((e) => e.message).join('; ');
+    throw new Error(`medium.com search failed: ${msg}`);
+  }
+
+  const search = data.data && data.data.search;
+  if (!search || search.__typename !== 'Search') {
+    return []; // empty / no results
+  }
+
+  const posts = search.posts && search.posts.items ? search.posts.items : [];
+  return posts.map(normalizeSearchPost);
+}
+
+function normalizeSearchPost(item) {
+  if (!item) return null;
+
+  // Older / alternate response shapes may wrap the post in item.post when
+  // item.__typename === 'SearchPostResult'. Unwrap in that case.
+  if (item.__typename === 'SearchPostResult' && item.post) {
+    item = item.post;
+  }
+
+  const title = item.title || '';
+  const mediumUrl = item.mediumUrl || '';
+
+  // If after unwrapping we still have no useful data, bail out.
+  if (!title && !mediumUrl) return null;
+
+  const creator = item.creator
+    ? item.creator.name || item.creator.username || ''
+    : '';
+  const readingTime = item.readingTime != null ? item.readingTime : 0;
+  const publishedAt = item.firstPublishedAt
+    ? new Date(item.firstPublishedAt).toISOString()
+    : '';
+  const claps = item.clapCount != null ? item.clapCount : 0;
+  const locked = !!item.isLocked;
+
+  // topics
+  const topics = (item.topics || [])
+    .map((t) => t.displayTitle || '')
+    .filter(Boolean);
+  if (item.collection && item.collection.name) {
+    topics.unshift(item.collection.name);
+  }
+
+  const uniqueSlug = item.uniqueSlug || '';
+
+  return {
+    id: item.id || mediumUrl || uniqueSlug || '',
+    title,
+    link: mediumUrl,
+    creator,
+    readingTime,
+    publishedAt,
+    claps,
+    locked,
+    topics,
+    uniqueSlug,
+  };
+}
+
+module.exports = {
+  fetchArticle,
+  fetchTopicFeed,
+  fetchTopicRss,
+  fetchMediumTopic,
+  fetchTopicFeeds,
+  parseRssItems,
+  normalizePost,
+  extractArticle,
+  downloadArticle,
+  normalizeUrl,
+  searchMediumQuery,
+  normalizeSearchPost,
+};

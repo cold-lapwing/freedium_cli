@@ -2,6 +2,11 @@
   "name": "freediumcli",
   "version": "1.0.0",
   "description": "Freedium — read Medium articles without the paywall, right in your terminal",
+  "author": "Harsh Kamble",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cold-lapwing/freedium_cli/"
+  },
   "main": "src/index.js",
   "type": "commonjs",
   "bin": {
@@ -27,5 +32,8 @@
     "links",
     "article"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "freediumcli": "^1.0.0"
+  }
 }
